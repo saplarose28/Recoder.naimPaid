@@ -1,0 +1,9 @@
+{
+  "name": "rec-bot",
+  "main": "worker.js",
+  "compatibility_date": "2025-01-01",
+  "keep_vars": true,
+  "kv_namespaces": [
+    { "binding": "KV", "id": "60d8edf914b64c07b47af030ed91ebc8" }
+  ]
+}

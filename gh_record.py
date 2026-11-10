@@ -110,9 +110,11 @@ def _origin(u):
     return m.group(1) if m else ""
 
 
-KB = {"inline_keyboard": [[{"text": "📊 Status", "callback_data": "status"},
-                           {"text": "✂️ Split", "callback_data": "split"},
-                           {"text": "⏹ Stop", "callback_data": "stop"}]]}
+RUN = os.environ.get("GITHUB_RUN_ID", "")     # every run signs its own buttons, so two recordings never get mixed up
+_s = ("@" + RUN) if RUN else ""
+KB = {"inline_keyboard": [[{"text": "📊 Status", "callback_data": "status" + _s},
+                           {"text": "✂️ Split", "callback_data": "split" + _s},
+                           {"text": "⏹ Stop", "callback_data": "stop" + _s}]]}
 
 
 def tg(method, **data):
@@ -495,6 +497,7 @@ def status_text():
 
 def do_action(act, cq_id=None):
     global SP
+    act = (act or "").split("@")[0]
     if act == "status":
         txt = "Status sent"; say(status_text(), buttons=True)
     elif act == "split":
@@ -751,11 +754,11 @@ def worker_poll():
     chats = ",".join(dict.fromkeys([c for c in [CHAT] + ALSO if c]))
     while not stop.is_set():
         try:
-            for c in (worker_get("/cmd?chats=" + urllib.parse.quote(chats)) or {}).get("cmds", []):
+            for c in (worker_get("/cmd?chats=" + urllib.parse.quote(chats) + "&run=" + RUN + "&me=" + urllib.parse.quote(CHAT or "")) or {}).get("cmds", []):
                 do_action(c)
         except Exception as e:
             print("worker poll failed:", repr(e)[:100], flush=True)
-        for _ in range(8):
+        for _ in range(20):
             if stop.is_set():
                 return
             time.sleep(0.5)

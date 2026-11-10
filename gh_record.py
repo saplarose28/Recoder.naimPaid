@@ -758,7 +758,7 @@ def worker_poll():
                 do_action(c)
         except Exception as e:
             print("worker poll failed:", repr(e)[:100], flush=True)
-        for _ in range(20):
+        for _ in range(8):
             if stop.is_set():
                 return
             time.sleep(0.5)

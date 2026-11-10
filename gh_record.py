@@ -495,6 +495,327 @@ def status_text():
     return "\n".join(lines)
 
 
+SPIN = "⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏"
+WAVE = "▁▂▃▄▅▆▇█▇▆▅▄▃▂"
+LINE = "━" * 18
+
+
+def bar(frac, n=20, head=True):
+    k = max(0, min(n, int(frac * n)))
+    if head and 0 < k < n:
+        return "█" * (k - 1) + "▓" + "░" * (n - k)
+    return "█" * k + "░" * (n - k)
+
+
+def spark(vals):
+    if not vals:
+        return ""
+    hi = max(max(vals), 0.1)
+    return "".join(WAVE[:8][min(7, int(v / hi * 7.99))] for v in vals)
+
+
+def clock(t=None):
+    return time.strftime("%H:%M:%S", time.gmtime((t or time.time()) + float(E("TZ_HOURS") or 6) * 3600))
+
+
+def live_text(i, ended=False, hist=()):
+    """The one message that is edited every few seconds: moving wave, spinner, progress bar, speed graph and the main numbers."""
+    el = time.time() - S["t0"]
+    sp = SP
+    spd = sp.speed_mbps() if sp else 0
+    saved = sum(d["size"] for d in S["done"])
+    wave = "".join(WAVE[(i + k) % len(WAVE)] for k in range(7))
+    if ended:
+        head = "✅ <b>FINISHED</b>"
+    elif ARCHIVE:
+        head = "⬇️ <b>DOWNLOADING</b>  %s  %s" % (SPIN[i % len(SPIN)], wave)
+    else:
+        head = "%s <b>LIVE RECORDING</b>  %s  %s" % ("🔴" if i % 2 == 0 else "⭕", SPIN[i % len(SPIN)], wave)
+    L = [head, LINE, "🎬 <b>%s</b>" % esc(NAME), ""]
+    if ARCHIVE:
+        frac, eta, txt = None, None, ""
+        if KIND == "ts" and D["total"]:
+            frac = D["got"] / max(1, D["total"])
+            txt = "%s / %s" % (human(D["got"]), human(D["total"]))
+            if spd > 0.1:
+                eta = (D["total"] - D["got"]) * 8 / (spd * 1e6)
+        elif KIND != "ts" and D["dur"]:
+            frac = D["secs"] / max(1, D["dur"])
+            txt = "%s / %s of video" % (mmss(D["secs"]), mmss(D["dur"]))
+            if D["secs"] > 5:
+                eta = (D["dur"] - D["secs"]) * el / D["secs"]
+        if frac is not None:
+            frac = min(1.0, frac)
+            L += ["📥 <b>Download</b>", "<code>%s</code>  <b>%d%%</b>" % (bar(frac), int(frac * 100)), txt]
+            if eta and not ended:
+                L.append("⏳ ~%s left  ·  done around <b>%s</b>" % (hms(eta), clock(time.time() + eta)))
+            L.append("")
+    elif sp:
+        f = min(1.0, sp.cur_bytes / PART_MAX) if PART_MAX else 0
+        L += ["📦 <b>File #%02d</b>" % sp.part_no, "<code>%s</code>  <b>%d%%</b>" % (bar(f), int(f * 100)),
+              "%s / %s  ·  %s of video" % (human(sp.cur_bytes), human(PART_MAX), mmss(sp.media_secs())), ""]
+        idle = time.time() - sp.last_es
+        if not ended:
+            L.append("%s" % ("🟢 Stream is live" if idle < 10 else ("🟡 Waiting for data (%ds)" % idle if idle < 60 else "🔴 No data for %s" % mmss(idle))))
+    if hist and not ended:
+        L += ["📈 <b>Speed</b>  %.1f Mbps" % spd, "<code>%s</code>" % spark(hist)]
+    else:
+        L.append("⚡ <b>Speed</b>  %.1f Mbps" % spd)
+    L += ["", "⏱ <b>Time</b>   %s" % hms(el), "✅ <b>Saved</b>  %d file(s)  ·  %s" % (len(S["done"]), human(saved))]
+    if S["restarts"]:
+        L.append("♻️ <b>Reconnects</b>  %d  (no data lost)" % S["restarts"])
+    if S["page"]:
+        L.append('📂 <a href="%s">Open the download page</a>' % S["page"])
+    L += [LINE, "🕒 Updated %s" % clock()]
+    return "\n".join(L)
+
+
+
+_PIL = []
+
+
+def _pil():
+    """Pillow draws the picture card. Installed on the fly if the runner does not have it; None = use the text panel."""
+    if _PIL:
+        return _PIL[0]
+    mods = None
+    for attempt in (0, 1):
+        try:
+            from PIL import Image, ImageDraw, ImageFont
+            mods = (Image, ImageDraw, ImageFont)
+            break
+        except Exception:
+            if attempt == 0:
+                try:
+                    subprocess.run([sys.executable, "-m", "pip", "install", "-q", "--break-system-packages", "pillow"],
+                                   timeout=150, capture_output=True)
+                except Exception:
+                    pass
+    _PIL.append(mods)
+    return mods
+
+
+def _font(ImageFont, size, bold=False):
+    for f in (("DejaVuSans-Bold.ttf" if bold else "DejaVuSans.ttf"), ("LiberationSans-Bold.ttf" if bold else "LiberationSans-Regular.ttf")):
+        for d in ("/usr/share/fonts/truetype/dejavu/", "/usr/share/fonts/truetype/liberation/", "/usr/share/fonts/dejavu/", ""):
+            try:
+                return ImageFont.truetype(d + f, size)
+            except Exception:
+                continue
+    return ImageFont.load_default()
+
+
+def live_card(i, ended=False, hist=()):
+    """A 1000x560 picture: ring progress, stat tiles and a speed graph. Returns PNG bytes."""
+    mods = _pil()
+    if not mods:
+        return None
+    Image, ImageDraw, ImageFont = mods
+    import io
+    K = 2
+    W, H = 1000, 560
+    img = Image.new("RGB", (W * K, H * K))
+    d = ImageDraw.Draw(img)
+    for y in range(H * K):                                            # background gradient
+        t = y / (H * K)
+        d.line([(0, y), (W * K, y)], fill=(int(14 + 14 * t), int(16 + 14 * t), int(36 + 28 * t)))
+    F = lambda sz, b=False: _font(ImageFont, sz * K, b)
+    def T(x, y, txt, font, fill, anchor="la"):
+        d.text((x * K, y * K), txt, font=font, fill=fill, anchor=anchor)
+    def R(x0, y0, x1, y1, r, fill):
+        d.rounded_rectangle((x0 * K, y0 * K, x1 * K, y1 * K), radius=r * K, fill=fill)
+
+    el = time.time() - S["t0"]
+    sp = SP
+    spd = sp.speed_mbps() if sp else 0
+    saved = sum(x["size"] for x in S["done"])
+    if ended:
+        accent, title = (60, 220, 130), "FINISHED"
+    elif ARCHIVE:
+        accent, title = (80, 165, 255), "DOWNLOADING ARCHIVE"
+    else:
+        accent, title = (255, 77, 94), "LIVE RECORDING"
+    muted, white, track, tile = (140, 148, 190), (240, 243, 255), (44, 49, 90), (30, 35, 72)
+
+    # header
+    pulse = 13 if (i % 2 == 0 or ended) else 9
+    cx, cy = 52, 56
+    d.ellipse(((cx - pulse) * K, (cy - pulse) * K, (cx + pulse) * K, (cy + pulse) * K), fill=accent)
+    T(80, 56, title, F(34, True), white, "lm")
+    nm = NAME if len(NAME) <= 34 else NAME[:33] + "…"
+    T(52, 108, nm, F(26), muted, "lm")
+    d.line((52 * K, 138 * K, (W - 52) * K, 138 * K), fill=track, width=2 * K)
+
+    # ring
+    frac, sub, center = 0.0, "", "--"
+    tiles = []
+    if ARCHIVE:
+        eta = None
+        if KIND == "ts" and D["total"]:
+            frac = D["got"] / max(1, D["total"]); sub = "downloaded"
+            if spd > 0.1:
+                eta = (D["total"] - D["got"]) * 8 / (spd * 1e6)
+            got = "%s / %s" % (human(D["got"]), human(D["total"]))
+        elif KIND != "ts" and D["dur"]:
+            frac = D["secs"] / max(1, D["dur"]); sub = "downloaded"
+            if D["secs"] > 5:
+                eta = (D["dur"] - D["secs"]) * el / D["secs"]
+            got = "%s / %s" % (mmss(D["secs"]), mmss(D["dur"]))
+        else:
+            got = human(D["got"])
+        tiles = [("TIME", hms(el)), ("SPEED", "%.1f Mbps" % spd), ("DOWNLOADED", got),
+                 ("TIME LEFT", ("~" + hms(eta)) if (eta and not ended) else "--")]
+    else:
+        frac = min(1.0, sp.cur_bytes / PART_MAX) if (sp and PART_MAX) else 0.0
+        sub = "of file #%02d" % (sp.part_no if sp else 0)
+        tiles = [("TIME", hms(el)), ("SPEED", "%.1f Mbps" % spd),
+                 ("SAVED", "%d file(s) · %s" % (len(S["done"]), human(saved))),
+                 ("VIDEO", mmss(sp.media_secs()) if sp else "0:00")]
+    frac = max(0.0, min(1.0, frac))
+    center = "%d%%" % int(frac * 100)
+    rcx, rcy, rr, rw = 230, 322, 128, 26
+    box = ((rcx - rr) * K, (rcy - rr) * K, (rcx + rr) * K, (rcy + rr) * K)
+    d.arc(box, 0, 360, fill=track, width=rw * K)
+    if frac > 0.004:
+        d.arc(box, -90, -90 + 360 * frac, fill=accent, width=rw * K)
+    T(rcx, rcy - 6, center, F(54, True), white, "mm")
+    T(rcx, rcy + 40, sub, F(21), muted, "mm")
+
+    # status pill
+    if not ARCHIVE and sp and not ended:
+        idle = time.time() - sp.last_es
+        col, txt = ((60, 220, 130), "STREAM LIVE") if idle < 10 else (((255, 190, 60), "WAITING FOR DATA") if idle < 60 else ((255, 77, 94), "NO DATA"))
+        R(130, 478, 330, 512, 17, tile)
+        d.ellipse((146 * K, 489 * K, 158 * K, 501 * K), fill=col)
+        T(172, 495, txt, F(17, True), white, "lm")
+
+    # tiles 2x2
+    pos = [(470, 160), (716, 160), (470, 262), (716, 262)]
+    for (lab, val), (x, y) in zip(tiles, pos):
+        R(x, y, x + 232, y + 92, 14, tile)
+        T(x + 18, y + 24, lab, F(15, True), muted, "lm")
+        fs = 26 if len(val) <= 14 else (21 if len(val) <= 20 else 17)
+        T(x + 18, y + 61, val, F(fs, True), white, "lm")
+
+    # speed graph
+    R(470, 376, 948, 512, 14, tile)
+    T(488, 396, "SPEED (Mbps)", F(15, True), muted, "lm")
+    vals = list(hist)[-16:] if hist else []
+    if len(vals) >= 2:
+        hi = max(max(vals), 0.5) * 1.15
+        gx0, gx1, gy0, gy1 = 490, 928, 498, 414
+        pts = [(gx0 + (gx1 - gx0) * k / (len(vals) - 1), gy0 - (gy0 - gy1) * min(1, v / hi)) for k, v in enumerate(vals)]
+        d.polygon([(x * K, y * K) for x, y in pts] + [(gx1 * K, gy0 * K), (gx0 * K, gy0 * K)], fill=tuple(int(c * 0.35 + 30 * 0.65) for c in accent))
+        d.line([(x * K, y * K) for x, y in pts], fill=accent, width=4 * K, joint="curve")
+        lx, ly = pts[-1]
+        d.ellipse(((lx - 6) * K, (ly - 6) * K, (lx + 6) * K, (ly + 6) * K), fill=white)
+        T(928, 396, "now %.1f   max %.1f" % (vals[-1], max(vals)), F(15), muted, "rm")
+
+    # footer
+    foot = "Reconnects: %d" % S["restarts"] if S["restarts"] else "No reconnects"
+    T(52, 538, foot, F(16), muted, "lm")
+    T(W - 52, 538, "Updated " + clock(), F(16), muted, "rm")
+    out = img.resize((W, H), Image.LANCZOS)
+    b = io.BytesIO()
+    out.save(b, "PNG", optimize=False)
+    return b.getvalue()
+
+
+def live_caption(ended=False):
+    L = ["✅ <b>Finished</b>" if ended else ("⬇️ <b>Downloading</b>" if ARCHIVE else "🔴 <b>Recording</b>"), "🎬 %s" % esc(NAME)]
+    if ARCHIVE and not ended and KIND == "ts" and D["total"] and SP and SP.speed_mbps() > 0.1:
+        eta = (D["total"] - D["got"]) * 8 / (SP.speed_mbps() * 1e6)
+        L.append("⏳ ~%s left  ·  done around <b>%s</b>" % (hms(eta), clock(time.time() + eta)))
+    if S["page"]:
+        L.append('📂 <a href="%s">Open the download page</a>' % S["page"])
+    return "\n".join(L)
+
+
+def tg_photo(method, fields, png):
+    """multipart upload of the card (sendPhoto / editMessageMedia)."""
+    if not TOKEN or DRY:
+        return {}
+    bd = "----rec%x" % int(time.time() * 1000)
+    body = b""
+    for k, v in fields.items():
+        body += ("--%s\r\nContent-Disposition: form-data; name=\"%s\"\r\n\r\n%s\r\n" % (bd, k, v)).encode()
+    body += ("--%s\r\nContent-Disposition: form-data; name=\"card\"; filename=\"card.png\"\r\nContent-Type: image/png\r\n\r\n" % bd).encode() + png + ("\r\n--%s--\r\n" % bd).encode()
+    try:
+        req = urllib.request.Request("%s/bot%s/%s" % (E("TG_API") or "https://api.telegram.org", TOKEN, method), body,
+                                     {"Content-Type": "multipart/form-data; boundary=" + bd})
+        return json.load(urllib.request.urlopen(req, timeout=60))
+    except urllib.error.HTTPError as e:
+        try: print("Telegram error %s: %s" % (e.code, e.read().decode()[:200]), flush=True)
+        except Exception: pass
+        return {"ok": False, "error_code": e.code}
+    except Exception as e:
+        print("telegram error:", e)
+        return {}
+
+
+def live_loop():
+    cids = list(dict.fromkeys([c for c in [CHAT] + ALSO if c]))
+    if not cids:
+        return
+    ids, bad, hist = {}, {}, []
+    use_img = E("LIVE_CARD") == "1" and bool(_pil())      # picture card is off by default: set LIVE_CARD=1 to try it
+    print("Live panel: %s" % ("picture card" if use_img else "text"), flush=True)
+    i = 0
+    while True:
+        ended = stop.is_set()
+        png = text = None
+        try:
+            hist = (hist + [SP.speed_mbps() if SP else 0.0])[-16:]
+            if use_img:
+                png = live_card(i, ended, hist)
+            if not png:
+                text = live_text(i, ended, hist)
+        except Exception as e:
+            print("live panel:", repr(e)[:120], flush=True)
+            if use_img:
+                use_img = False; ids.clear(); bad.clear()           # picture failed: use the text panel instead
+            if ended:
+                return
+            time.sleep(5); i += 1; continue
+        kb = json.dumps({"inline_keyboard": []} if ended else KB)
+        for cid in cids:
+            if bad.get(cid, 0) >= 3:
+                continue
+            if png:
+                cap = live_caption(ended)
+                if cid in ids:
+                    r = tg_photo("editMessageMedia", {"chat_id": cid, "message_id": ids[cid], "reply_markup": kb,
+                                 "media": json.dumps({"type": "photo", "media": "attach://card", "caption": cap, "parse_mode": "HTML"})}, png)
+                else:
+                    r = tg_photo("sendPhoto", {"chat_id": cid, "caption": cap, "parse_mode": "HTML", "reply_markup": kb}, png)
+            else:
+                d = dict(chat_id=cid, text=text, parse_mode="HTML", disable_web_page_preview="true", reply_markup=kb)
+                if cid in ids:
+                    d["message_id"] = ids[cid]
+                r = tg("editMessageText" if cid in ids else "sendMessage", **d)
+            if r.get("error_code") == 429:
+                time.sleep(20)
+            elif r.get("error_code"):
+                bad[cid] = bad.get(cid, 0) + 1
+                if r.get("error_code") == 400:
+                    ids.pop(cid, None)                              # message deleted: send a new one
+                if bad[cid] >= 3 and use_img and not ids:
+                    use_img = False; ids.clear(); bad.clear()       # picture keeps failing: switch to text
+                    break
+            else:
+                bad[cid] = 0
+                mid = (r.get("result") or {}).get("message_id")
+                if mid and cid not in ids:
+                    ids[cid] = mid
+        if ended:
+            return
+        i += 1
+        for _ in range(20 if use_img else 10):
+            if stop.is_set():
+                break
+            time.sleep(0.5)
+
+
 def do_action(act, cq_id=None):
     global SP
     act = (act or "").split("@")[0]
@@ -598,14 +919,35 @@ def media_info(path):
         return 0.0, 0, 0
 
 
+def remux(ts, mp4):
+    """.ts -> .mp4 without re-encoding. Tries a few ways because some streams carry data tracks or audio that mp4 cannot hold."""
+    tries = [["-map", "0:v?", "-map", "0:a?", "-c", "copy"],
+             ["-map", "0:v?", "-map", "0:a?", "-c:v", "copy", "-c:a", "aac", "-b:a", "160k"],
+             ["-c", "copy"]]
+    first = ""
+    for extra in tries:
+        r = subprocess.run(["nice", "-n", "10", "ffmpeg", "-hide_banner", "-loglevel", "error", "-y", "-i", ts] + extra +
+                           ["-avoid_negative_ts", "make_zero", "-movflags", "+faststart", mp4], capture_output=True, text=True)
+        if r.returncode == 0 and os.path.exists(mp4) and os.path.getsize(mp4) > 0:
+            return True, ""
+        if not first:
+            lines = [l for l in (r.stderr or "").strip().splitlines() if l.strip()]
+            first = lines[-1] if lines else "ffmpeg exit code %s" % r.returncode
+        try: os.remove(mp4)
+        except OSError: pass
+    return False, first
+
+
 def process(ts):
     """remux the finished .ts to .mp4 (proper duration), upload it, tell Telegram, clean up."""
     os.makedirs(MP4_DIR, exist_ok=True)
     base = os.path.basename(ts)[:-3] + ".mp4"
     mp4 = os.path.join(MP4_DIR, base)
-    r = subprocess.run(["nice", "-n", "10", "ffmpeg", "-hide_banner", "-loglevel", "error", "-y", "-i", ts, "-c", "copy", "-avoid_negative_ts", "make_zero", "-movflags", "+faststart", mp4],
-                       capture_output=True, text=True)
-    if r.returncode != 0 or not os.path.exists(mp4):
+    ok_mp4, why = remux(ts, mp4)
+    note = ""
+    if not ok_mp4:
+        print("MP4 conversion failed, uploading the .ts instead:", why, flush=True)
+        note = "\n⚠️ MP4 conversion failed, so this is the .ts file (it plays the same).\n<code>%s</code>" % esc(why[:150])
         mp4 = ts; base = os.path.basename(ts)
     elif not DRY:
         try: os.remove(ts)                           # free disk space right away
@@ -614,7 +956,7 @@ def process(ts):
     dur = media_info(mp4)[0]
     n = len(S["done"]) + 1
     ok, link, err = gofile_upload(mp4)
-    head = "✅ <b>File %d saved</b>\n🎞 %s  ·  %s\n" % (n, mmss(dur), human(size))
+    head = "✅ <b>File %d saved</b>\n🎞 %s  ·  %s\n" % (n, mmss(dur), human(size)) + (note + "\n" if note else "")
     if ok:
         if link:
             S["page"] = link
@@ -1103,6 +1445,8 @@ def record():
                 say("✅ <b>Stream is back</b> after %s. Recording continues in the same file." % mmss(time.time() - since))
             time.sleep(5)
     threading.Thread(target=stream_monitor, daemon=True).start()
+    if not DRY:
+        threading.Thread(target=live_loop, daemon=True).start()
 
     last_err = []; first = True; consec = 0; hi = [0]
     dl_ok = True

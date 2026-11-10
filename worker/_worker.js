@@ -61,7 +61,7 @@ async function telegram(req, env) {
   if (up.callback_query) {                                     // a button was pressed
     const cq = up.callback_query;
     const chat = String((cq.message && cq.message.chat && cq.message.chat.id) ?? cq.from.id);
-    if (!allowed.includes(chat) || !["status", "split", "stop"].includes(cq.data)) {
+    if (!allowed.includes(chat) || !["status", "split", "stop"].includes(String(cq.data).split("@")[0])) {
       await tgApi(env, "answerCallbackQuery", { callback_query_id: cq.id, text: "Not allowed" });
       return new Response("ok");
     }
@@ -129,7 +129,7 @@ async function giveLink(req, env, u) {
 async function giveCmds(req, env, u) {
   if (!keyOk(req, env)) return json({}, 403);
   const run = u.searchParams.get("run") || "";
-  const me = u.searchParams.get("me") || "";
+  const meRaw = u.searchParams.get("me");                       // an older gh_record.py sends no "me": then typed commands go to every run of that chat
   const out = [];
   for (const c of (u.searchParams.get("chats") || "").split(",").map((s) => s.trim()).filter(Boolean)) {
     const k = "cmd:" + c;
@@ -139,7 +139,7 @@ async function giveCmds(req, env, u) {
     for (const x of JSON.parse(v)) {
       const at = x.indexOf("@");
       // a button carries its run id: only that run takes it. A typed command goes only to the run that chat started.
-      const mine = at >= 0 ? x.slice(at + 1) === run : c === me;
+      const mine = at >= 0 ? x.slice(at + 1) === run : (meRaw === null || c === meRaw);
       if (mine) { if (!out.includes(x.split("@")[0])) out.push(x.split("@")[0]); } else keep.push(x);
     }
     if (keep.length) await env.KV.put(k, JSON.stringify(keep), { expirationTtl: 600 });

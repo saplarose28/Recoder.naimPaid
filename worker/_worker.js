@@ -66,7 +66,7 @@ async function telegram(req, env) {
       return new Response("ok");
     }
     await pushCmd(env, chat, cq.data);
-    await tgApi(env, "answerCallbackQuery", { callback_query_id: cq.id, text: String(cq.data).startsWith("stop") ? "Stopping... (up to a minute)" : "Sent (up to a minute)" });
+    await tgApi(env, "answerCallbackQuery", { callback_query_id: cq.id, text: String(cq.data).startsWith("stop") ? "Stopping... (few seconds)" : "Sent (few seconds)" });
     return new Response("ok");
   }
 
@@ -87,7 +87,7 @@ async function telegram(req, env) {
   }
   if (cmd === "/status" || cmd === "/split" || cmd === "/stop") {
     await pushCmd(env, chat, cmd.slice(1));
-    await send(env, chat, "👌 Sent to your running recording (it can take up to a minute). If nothing is recording, nothing happens.");
+    await send(env, chat, "👌 Sent to your running recording (it takes a few seconds). If nothing is recording, nothing happens.");
     return new Response("ok");
   }
 

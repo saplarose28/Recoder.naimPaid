@@ -30,6 +30,10 @@ NAME = re.sub(r"[^\w\-]+", "_", E("NAME") or "ClipByNaim")
 MINUTES = float(E("MINUTES") or 0)             # 0 = until Stop
 PART_MIN = float(E("PART_MIN") or 0)            # optional: also split every N minutes (0 = off, split by size only)
 PART_MAX = min(float(E("PART_MB") or 4000), 5000) * 1e6   # a new file every N MB (4000 = 4 GB)
+PARALLEL = int(E("PARALLEL") or 16)             # heavy archive links: this many parallel connections (0 or 1 = off)
+LIVE_PAR = E("LIVE_PAR") or "auto"             # live .m3u8: auto = parallel parts only if the normal way would skip some; 1 = always, 0 = never
+HEAVY_MB = float(E("HEAVY_MB") or 300)          # a .ts archive at least this big counts as heavy
+HEAVY_MIN = float(E("HEAVY_MIN") or 15)         # an .m3u8 archive at least this long (minutes) counts as heavy
 BACK = E("BACK_SEGS") or "5"                    # start N segments behind live (safety)
 PROXY = (E("PROXY") or "").strip()              # optional: http://user:pass@host:port - the stream is fetched through this proxy (e.g. a Bangladesh IP)
 MODE = (E("MODE") or "auto").strip().lower()     # auto (finds out itself), live, or archive (a finished file: timeshift / catch-up .ts or .m3u8)
@@ -241,6 +245,7 @@ class Splitter:
         self.hist = []
         self.aud = set(); self.cc = {}; self.last_wr = {}
         self.off = 0; self.last_out_v = None; self.fdur = 3600; self.rebased = 0     # timestamp shift so reconnects join smoothly
+        self.gap_total = 0.0
         self.skip = None; self.dropping = set(); self.drop_bytes = 0; self.deduped = 0; self.last_write = time.time(); self.last_es = time.time()
         self.need_key = False; self.need_key_until = 0
         self.first_pts = None
@@ -421,6 +426,8 @@ class Splitter:
                             if self.last_out_v is not None:
                                 self.off = (self.last_out_v + self.fdur - dts) & M33
                                 self.rebased += 1
+                                if dd > 0:
+                                    self.gap_total += dd / 90000.0
                                 print("Clock jump %+.1fs: timeline joined smoothly (join #%d)" % (dd / 90000.0, self.rebased), flush=True)
                         elif 0 < dd <= 18000:
                             self.fdur = dd                # normal picture spacing, used to place the first picture after a join
@@ -481,6 +488,8 @@ def status_text():
         "✅ <b>Saved</b>  %d file(s)  ·  %s" % (len(S["done"]), human(saved)),
         "⚡ <b>Speed</b>  %.1f Mbps" % spd + nxt,
     ]
+    if not ARCHIVE:
+        lines.insert(4, "🎞 <b>Total recorded</b>  %s" % hms(sum(d.get("secs", 0) for d in S["done"]) + (sp.media_secs() if sp else 0)))
     if ARCHIVE:
         if KIND == "ts" and D["total"]:
             lines.append("📥 <b>Downloaded</b>  %s of %s  (%d%%)" % (human(D["got"]), human(D["total"]), 100 * D["got"] // max(1, D["total"])))
@@ -541,7 +550,7 @@ def live_text(i, ended=False, hist=()):
                 eta = (D["total"] - D["got"]) * 8 / (spd * 1e6)
         elif KIND != "ts" and D["dur"]:
             frac = D["secs"] / max(1, D["dur"])
-            txt = "%s / %s of video" % (mmss(D["secs"]), mmss(D["dur"]))
+            txt = "🎞 %s downloaded  ·  %s left" % (mmss(D["secs"]), mmss(max(0, D["dur"] - D["secs"])))
             if D["secs"] > 5:
                 eta = (D["dur"] - D["secs"]) * el / D["secs"]
         if frac is not None:
@@ -554,6 +563,7 @@ def live_text(i, ended=False, hist=()):
         f = min(1.0, sp.cur_bytes / PART_MAX) if PART_MAX else 0
         L += ["📦 <b>File #%02d</b>" % sp.part_no, "<code>%s</code>  <b>%d%%</b>" % (bar(f), int(f * 100)),
               "%s / %s  ·  %s of video" % (human(sp.cur_bytes), human(PART_MAX), mmss(sp.media_secs())), ""]
+        L.insert(len(L) - 1, "🎞 <b>Total recorded</b>  %s" % hms(sum(x.get("secs", 0) for x in S["done"]) + sp.media_secs()))
         idle = time.time() - sp.last_es
         if not ended:
             L.append("%s" % ("🟢 Stream is live" if idle < 10 else ("🟡 Waiting for data (%ds)" % idle if idle < 60 else "🔴 No data for %s" % mmss(idle))))
@@ -1297,7 +1307,7 @@ def wait_drain(rq):
 def dl_hls_once(rq, first):
     """One ffmpeg run over a finished .m3u8. After a failure it starts a few seconds before where it stopped."""
     before = D["secs"]
-    ss = ["-ss", "%.1f" % (D["secs"] - 10)] if D["secs"] > 15 else []
+    ss = ["-ss", "%.1f" % (D["secs"] - 30)] if D["secs"] > 35 else []        # restart 30 s earlier, the repeated part is dropped
     cmd = ["ffmpeg", "-hide_banner", "-loglevel", "warning", "-y", "-fflags", "+discardcorrupt+genpts", "-rw_timeout", "60000000",
            "-reconnect", "1", "-reconnect_streamed", "1", "-reconnect_delay_max", "15", "-seg_max_retry", "15", "-http_persistent", "0"] + ss + HDR + [
            "-i", URL, "-map", "0:v?", "-map", "0:a?", "-c", "copy", "-copyts", "-muxdelay", "0", "-muxpreload", "0",
@@ -1325,21 +1335,451 @@ def dl_hls_once(rq, first):
     return False, why_exit(p.returncode, err)
 
 
+def archive_report():
+    """After an archive download: does the file have everything the playlist promised?"""
+    try:
+        got = D["secs"] if KIND != "ts" else (SP.media_total() if SP else 0)
+        jumps = SP.rebased if SP else 0
+        gap = SP.gap_total if SP else 0.0
+        lines = []
+        if KIND != "ts" and D["dur"]:
+            miss = D["dur"] - got
+            if miss > 15:
+                lines.append("⚠️ <b>The file is %s shorter than the playlist</b> (playlist %s, file %s).\nSome parts could not be downloaded from the server." % (mmss(miss), mmss(D["dur"]), mmss(got)))
+            else:
+                lines.append("✅ <b>Complete:</b> the file is as long as the playlist (%s)." % mmss(D["dur"]))
+        if jumps > 1:
+            lines.append("ℹ️ The archive's own clock jumps %d times (%s skipped on its clock). If the length above matches, nothing was lost by the download: the provider's archive itself has these breaks." % (jumps, mmss(gap)))
+        print("Archive report: playlist=%s file=%.1fs jumps=%d jump_total=%.1fs" % (D["dur"], got, jumps, gap), flush=True)
+        if lines:
+            say("\n".join(lines))
+    except Exception as e:
+        print("archive report failed:", repr(e)[:100], flush=True)
+
+
+class NotParallel(Exception):
+    """This link cannot be fetched in parallel pieces (server ignores Range, encrypted / fragmented playlist ...)."""
+
+
+def qput(rq, item):
+    while not stop.is_set():
+        try:
+            rq.put(item, timeout=1); return True
+        except queue.Full:
+            continue
+    return False
+
+
+def http_get(url, rng=None, timeout=40):
+    h = hdr_dict()
+    if rng:
+        h["Range"] = rng
+    r = stream_opener().open(urllib.request.Request(url, headers=h), timeout=timeout)
+    try:
+        return r.status, r.headers, r.read()
+    finally:
+        r.close()
+
+
+def retry(fn, tries=6):
+    last = None
+    for a in range(tries):
+        if stop.is_set():
+            raise RuntimeError("stopped")
+        try:
+            return fn()
+        except NotParallel:
+            raise
+        except Exception as e:
+            last = e
+            time.sleep(min(1 + a, 5))
+    raise last
+
+
+def ordered_parallel(n, fetch, emit, workers):
+    """Run fetch(i) for i in 0..n-1 on many threads, call emit(i, data) strictly in order.
+    Returns None when all n are emitted, else a short error text (everything before the failed piece was emitted)."""
+    res, cond = {}, threading.Condition()
+    st = {"next": 0, "emit": 0, "fail": None}
+    window = max(4, workers * 2)                               # at most this many pieces in memory ahead of the writer
+
+    def worker():
+        while True:
+            with cond:
+                while st["next"] < n and st["next"] - st["emit"] >= window and st["fail"] is None and not stop.is_set():
+                    cond.wait(1)
+                if st["fail"] is not None or st["next"] >= n or stop.is_set():
+                    return
+                i = st["next"]; st["next"] += 1
+            try:
+                data = retry(lambda: fetch(i))
+            except Exception as e:
+                with cond:
+                    if st["fail"] is None or i < st["fail"][0]:
+                        st["fail"] = (i, e)
+                    cond.notify_all()
+                return
+            with cond:
+                res[i] = data; cond.notify_all()
+
+    ths = [threading.Thread(target=worker, daemon=True) for _ in range(max(1, workers))]
+    for t in ths:
+        t.start()
+    err = None
+    while st["emit"] < n:
+        with cond:
+            while st["emit"] not in res and not stop.is_set() and not (st["fail"] and st["fail"][0] <= st["emit"]):
+                cond.wait(1)
+            if stop.is_set():
+                err = "stopped"; break
+            if st["emit"] not in res:
+                err = st["fail"][1]; break
+            data = res.pop(st["emit"])
+        if not emit(st["emit"], data):
+            err = "stopped"; break
+        with cond:
+            st["emit"] += 1; cond.notify_all()
+    with cond:
+        if err is not None and st["fail"] is None:
+            st["fail"] = (-1, err)
+        cond.notify_all()
+    for t in ths:
+        t.join(3)
+    if err is None:
+        return None
+    return mask(repr(err))[:150] if isinstance(err, Exception) else str(err)
+
+
+def parallel_ts(rq):
+    """Heavy .ts archive: pieces of 4 MB over many connections, written in order. True = file complete."""
+    try:
+        h = hdr_dict(); h["Range"] = "bytes=0-0"
+        r = stream_opener().open(urllib.request.Request(URL, headers=h), timeout=30)
+        try:
+            cr = r.headers.get("Content-Range") or ""
+            ok = r.status == 206 and cr.rsplit("/", 1)[-1].isdigit()
+        finally:
+            r.close()
+    except Exception:
+        return False
+    if not ok:
+        return False                                           # the server ignores Range: normal download
+    total = int(cr.rsplit("/", 1)[-1])
+    D["total"] = total
+    if total < HEAVY_MB * 1e6:
+        return False
+    start, CH = D["got"], int(float(E("PAR_CHUNK_MB") or 4) * (1 << 20))
+    n = -(-(total - start) // CH)
+    say("⚡ <b>Heavy file (%s)</b>\\nDownloading with %d parallel connections. If the server refuses, it continues the normal way." % (human(total), PARALLEL))
+    print("Parallel download: %d pieces of %.1f MB, %d connections" % (n, CH / 1048576, PARALLEL), flush=True)
+
+    def fetch(i):
+        a = start + i * CH
+        b = min(total, a + CH) - 1
+        stt, _, data = http_get(URL, "bytes=%d-%d" % (a, b))
+        if stt != 206:
+            raise NotParallel("server ignored Range")
+        if len(data) != b - a + 1:
+            raise IOError("short piece")
+        return data
+
+    def emit(i, data):
+        for k in range(0, len(data), 1 << 16):
+            if not qput(rq, ("d", data[k:k + (1 << 16)])):
+                return False
+        D["got"] += len(data); S["last_data"] = time.time()
+        return True
+    err = ordered_parallel(n, fetch, emit, PARALLEL)
+    wait_drain(rq)
+    if err:
+        print("Parallel download stopped (%s), continuing the normal way" % err, flush=True)
+        return False
+    return D["got"] >= total
+
+
+def hls_plan():
+    """For a simple finished .m3u8 (plain .ts segments, no encryption): [(url, seconds)...]. None if it needs ffmpeg."""
+    import urllib.parse as up
+    def get(u):
+        stt, _, b = http_get(u, None, 30)
+        return b.decode("utf-8", "ignore")
+    u = URL
+    text = get(u)
+    if "#EXT-X-STREAM-INF" in text:                            # master playlist: take the best quality
+        lines = text.splitlines(); best = None
+        if "TYPE=AUDIO" in text and re.search(r"#EXT-X-MEDIA:[^\n]*URI=", text):
+            return None                                        # separate audio playlist: let ffmpeg merge it
+        for k, l in enumerate(lines):
+            if l.startswith("#EXT-X-STREAM-INF"):
+                m = re.search(r"BANDWIDTH=(\d+)", l)
+                bw = int(m.group(1)) if m else 0
+                for l2 in lines[k + 1:]:
+                    if l2.strip() and not l2.startswith("#"):
+                        if best is None or bw > best[0]:
+                            best = (bw, up.urljoin(u, l2.strip()))
+                        break
+        if not best:
+            return None
+        u = best[1]; text = get(u)
+    if "#EXT-X-STREAM-INF" in text or "#EXT-X-MAP" in text or "#EXT-X-BYTERANGE" in text:
+        return None
+    if re.search(r"#EXT-X-KEY:(?!METHOD=NONE)", text):
+        return None                                            # encrypted
+    segs, dur = [], 0.0
+    for line in text.splitlines():
+        line = line.strip()
+        if line.startswith("#EXTINF:"):
+            try: dur = float(line[8:].split(",")[0])
+            except ValueError: dur = 0.0
+        elif line and not line.startswith("#"):
+            segs.append((up.urljoin(u, line), dur)); dur = 0.0
+    return segs or None
+
+
+P = {"seg": 0}
+
+
+def parallel_hls(rq):
+    """Heavy .m3u8 archive: segments fetched on many connections, written in order. True = complete."""
+    try:
+        segs = hls_plan()
+    except Exception as e:
+        print("Parallel plan failed:", mask(repr(e))[:120], flush=True)
+        return False
+    if not segs:
+        return False
+    total = sum(d for _, d in segs)
+    D["dur"] = total
+    if total < HEAVY_MIN * 60 or len(segs) < 20:
+        return False
+    say("⚡ <b>Heavy archive (%s, %d parts)</b>\\nDownloading with %d parallel connections. If the server refuses, it continues the normal way." % (hms(total), len(segs), PARALLEL))
+    print("Parallel download: %d segments, %d connections" % (len(segs), PARALLEL), flush=True)
+    fails = 0
+    while P["seg"] < len(segs) and not stop.is_set():
+        base = P["seg"]
+
+        def fetch(i):
+            stt, _, data = http_get(segs[base + i][0])
+            if stt != 200 or len(data) < 188 or data[0] != 0x47:
+                if base + i == 0:
+                    raise NotParallel("segments are not MPEG-TS")
+                raise IOError("bad segment")
+            return data
+
+        def emit(i, data):
+            for k in range(0, len(data), 1 << 16):
+                if not qput(rq, ("d", data[k:k + (1 << 16)])):
+                    return False
+            P["seg"] = base + i + 1
+            D["secs"] += segs[base + i][1]; S["last_data"] = time.time()
+            return True
+        err = ordered_parallel(len(segs) - base, fetch, emit, PARALLEL)
+        if err is None:
+            break
+        fails = 0 if P["seg"] > base else fails + 1
+        if stop.is_set():
+            return False
+        S["restarts"] += 1; S["reason"] = err
+        print("Parallel download interrupted (%s) at part %d of %d" % (err, P["seg"], len(segs)), flush=True)
+        if "segments are not MPEG-TS" in err or fails >= 6:
+            return False                                       # let ffmpeg continue from here
+        time.sleep(min(2 * fails + 1, 15))
+    if P["seg"] < len(segs):
+        return False
+    wait_drain(rq)
+    D["secs"] = max(SP.media_total(), 0.0) if SP else D["secs"]
+    return True
+
+
+PAR_LIVE = [False]      # live .m3u8 is recorded with many parallel connections (set by the probe or when gaps show up)
+PAR_OK = [True]         # False once we know this playlist cannot be fetched by hand (encrypted, fMP4 ...)
+
+
+def hls_media(u):
+    """Follow a master playlist to the best stream. Returns (media_url, text) or None if ffmpeg has to do it."""
+    import urllib.parse as up
+    def get(x):
+        return http_get(x, None, 25)[2].decode("utf-8", "ignore")
+    text = get(u)
+    if "#EXT-X-STREAM-INF" in text:
+        if "TYPE=AUDIO" in text and re.search(r"#EXT-X-MEDIA:[^\n]*URI=", text):
+            return None
+        lines = text.splitlines(); best = None
+        for k, l in enumerate(lines):
+            if l.startswith("#EXT-X-STREAM-INF"):
+                m = re.search(r"BANDWIDTH=(\d+)", l)
+                bw = int(m.group(1)) if m else 0
+                for l2 in lines[k + 1:]:
+                    if l2.strip() and not l2.startswith("#"):
+                        if best is None or bw > best[0]:
+                            best = (bw, up.urljoin(u, l2.strip()))
+                        break
+        if not best:
+            return None
+        u = best[1]; text = get(u)
+    if "#EXT-X-STREAM-INF" in text or "#EXT-X-MAP" in text or "#EXT-X-BYTERANGE" in text or re.search(r"#EXT-X-KEY:(?!METHOD=NONE)", text):
+        return None
+    return u, text
+
+
+def hls_parse(text, base):
+    import urllib.parse as up
+    m = re.search(r"#EXT-X-MEDIA-SEQUENCE:(\d+)", text)
+    seq = int(m.group(1)) if m else 0
+    segs, dur = [], 0.0
+    for line in text.splitlines():
+        line = line.strip()
+        if line.startswith("#EXTINF:"):
+            try: dur = float(line[8:].split(",")[0])
+            except ValueError: dur = 0.0
+        elif line and not line.startswith("#"):
+            segs.append((up.urljoin(base, line), dur)); dur = 0.0
+    return seq, segs, "#EXT-X-ENDLIST" in text
+
+
+def live_probe():
+    """Is one segment slower to download than it is long? Then the normal way falls behind the live edge and skips parts."""
+    try:
+        r = hls_media(URL)
+        if not r:
+            PAR_OK[0] = False
+            return False
+        seq, segs, ended = hls_parse(r[1], r[0])
+        if ended or len(segs) < 2:
+            return False
+        url, dur = segs[-2]
+        t = time.time()
+        http_get(url, None, 25)
+        took = time.time() - t
+        print("Speed check: one %.1fs part took %.1fs to download" % (dur, took), flush=True)
+        return dur > 0 and took > 0.5 * dur
+    except Exception as e:
+        print("Speed check failed:", mask(repr(e))[:100], flush=True)
+        return False
+
+
+def live_hls_parallel(rq):
+    """Live .m3u8: look at the playlist every second or two, fetch every new part at once on many connections,
+    write them in order. A slow server can no longer make us fall behind the live edge."""
+    try:
+        r = hls_media(URL)
+    except Exception as e:
+        return "playlist: " + mask(repr(e))[:100]
+    if not r:
+        PAR_OK[0] = False
+        return "fallback"
+    media = r[0]
+    jobs, res, cond = queue.Queue(), {}, threading.Condition()
+    st = {"emit": None, "next": None, "end": False}
+    my_stop = threading.Event()
+
+    def worker():
+        while not stop.is_set() and not my_stop.is_set():
+            try:
+                seq, url = jobs.get(timeout=1)
+            except queue.Empty:
+                continue
+            data = None
+            for a in range(3):
+                try:
+                    stt, _, b = http_get(url, None, 20)
+                    if stt == 200 and len(b) >= 188:
+                        data = b; break
+                except Exception:
+                    time.sleep(0.4)
+            with cond:
+                res[seq] = data; cond.notify_all()
+
+    def emitter():
+        while not stop.is_set() and not my_stop.is_set():
+            with cond:
+                while (st["emit"] is None or st["emit"] not in res) and not stop.is_set() and not my_stop.is_set():
+                    cond.wait(1)
+                if stop.is_set() or my_stop.is_set():
+                    return
+                data = res.pop(st["emit"]); n = st["emit"]; st["emit"] += 1
+            if data is None:
+                print("Part %d could not be downloaded (the server no longer has it)" % n, flush=True)
+                continue
+            for k in range(0, len(data), 1 << 16):
+                if not qput(rq, ("d", data[k:k + (1 << 16)])):
+                    return
+            S["last_data"] = time.time()
+
+    ths = [threading.Thread(target=worker, daemon=True) for _ in range(PARALLEL)] + [threading.Thread(target=emitter, daemon=True)]
+    for t in ths:
+        t.start()
+    bad, why = 0, "stopped"
+    back = int(BACK) if str(BACK).isdigit() else 3
+    try:
+        while not stop.is_set():
+            try:
+                text = http_get(media, None, 15)[2].decode("utf-8", "ignore")
+                seq, segs, ended = hls_parse(text, media)
+                bad = 0
+            except Exception as e:
+                bad += 1
+                if bad >= 20:
+                    why = "playlist not reachable: " + mask(repr(e))[:100]
+                    break
+                time.sleep(1); continue
+            if segs:
+                last = seq + len(segs) - 1
+                if st["next"] is None:
+                    avg = sum(d for _, d in segs if d) / max(1, len([1 for _, d in segs if d])) or 4.0
+                    safe = max(back, int(-(-30 // avg)))          # start at least 30 seconds behind the live edge (repeats are dropped)
+                    st["next"] = max(seq, last - safe + 1)
+                    with cond:
+                        st["emit"] = st["next"]
+                for k, (url, _) in enumerate(segs):
+                    if seq + k >= st["next"]:
+                        jobs.put((seq + k, url)); st["next"] = seq + k + 1
+                if st["next"] < seq:                            # we were so far behind that the server dropped parts
+                    st["next"] = seq
+            if ended:
+                why = "playlist ended"
+                break
+            tgt = min((d for _, d in segs if d), default=4.0)
+            time.sleep(max(0.7, min(2.0, tgt / 2.5)))
+    finally:
+        # let what is already downloaded go out, then end
+        t_end = time.time()
+        while time.time() - t_end < 15 and not stop.is_set():
+            with cond:
+                pending = [k for k in res] + [] if st["emit"] is not None else []
+                if not pending and jobs.empty():
+                    break
+            time.sleep(0.3)
+        my_stop.set()
+        with cond:
+            cond.notify_all()
+    return why
+
+
 def download_loop(rq):
     """Finished file (timeshift / catch-up): download everything, resume after every break. Returns True if complete."""
-    if KIND != "ts":
+    if PARALLEL > 1:
+        try:
+            if (parallel_ts(rq) if KIND == "ts" else parallel_hls(rq)):
+                archive_report()
+                return True
+        except Exception as e:
+            print("Parallel download failed, normal download instead:", mask(repr(e))[:150], flush=True)
+    if KIND != "ts" and not D["dur"]:
         try:
             r = subprocess.run(["ffprobe", "-v", "error"] + HDR + ["-show_entries", "format=duration", "-of", "csv=p=0", URL],
                                capture_output=True, text=True, timeout=90, env=fenv())
             D["dur"] = float((r.stdout or "").strip().split()[0])
         except Exception:
             D["dur"] = None
-    fails = n = 0
+    fails = 0
+    n = 1 if (D["got"] or D["secs"]) else 0                      # parallel part already wrote data: continue like after a break
     while not stop.is_set():
         before = D["got"] if KIND == "ts" else D["secs"]
         done, why = dl_ts_once(rq) if KIND == "ts" else dl_hls_once(rq, n == 0)
         n += 1
         if done:
+            archive_report()
             return True
         if stop.is_set():
             return False
@@ -1453,7 +1893,39 @@ def record():
     if ARCHIVE:
         dl_ok = download_loop(rq)
         stop.set()                                             # nothing more to fetch (also quiets the stream monitor)
+    if KIND == "hls" and not ARCHIVE and PARALLEL > 1 and LIVE_PAR != "0":
+        if LIVE_PAR == "1" or live_probe():
+            PAR_LIVE[0] = True
+            say("⚡ <b>Fast mode</b>\nThis link is slower than real time, so I record it with %d parallel connections. No parts are skipped." % PARALLEL)
+
+        def gap_watch():
+            while not stop.is_set():
+                time.sleep(2)
+                if PAR_OK[0] and not PAR_LIVE[0] and SP and SP.gap_total >= float(E("GAP_SWITCH") or 8):
+                    PAR_LIVE[0] = True
+                    say("⚡ <b>Parts are being skipped</b>, so I switch to %d parallel connections now." % PARALLEL)
+                    pr = S["proc"]
+                    if pr and pr.poll() is None:
+                        pr.send_signal(signal.SIGINT)
+        if LIVE_PAR != "1":
+            threading.Thread(target=gap_watch, daemon=True).start()
     while not stop.is_set() and not ARCHIVE:
+        if KIND == "hls" and PAR_LIVE[0] and PAR_OK[0]:
+            t_run = time.time()
+            why = live_hls_parallel(rq)
+            first = False
+            if stop.is_set() or TEST_ONCE:
+                break
+            if why == "fallback":
+                PAR_LIVE[0] = False
+                print("Parallel mode is not possible for this playlist, normal recording instead", flush=True)
+            S["restarts"] += 1
+            rq.put(("n", True, False))
+            S["reason"] = why
+            consec = 0 if time.time() - t_run > 30 else consec + 1
+            print("Reconnect %d (parallel mode): %s" % (S["restarts"], why), flush=True)
+            time.sleep(min(0.5 + 0.5 * consec, 5))
+            continue
         if KIND == "ts" and TS_RAW:
             # Direct download of the MPEG-TS bytes: reconnect takes milliseconds (no ffmpeg start, no probing), so even a
             # server that drops the link every second costs (almost) nothing. The splitter joins / de-duplicates as before.

@@ -66,7 +66,7 @@ async function telegram(req, env) {
       return new Response("ok");
     }
     await pushCmd(env, chat, cq.data);
-    await tgApi(env, "answerCallbackQuery", { callback_query_id: cq.id, text: cq.data === "stop" ? "Stopping... (up to a minute)" : "Sent (up to a minute)" });
+    await tgApi(env, "answerCallbackQuery", { callback_query_id: cq.id, text: String(cq.data).startsWith("stop") ? "Stopping... (up to a minute)" : "Sent (up to a minute)" });
     return new Response("ok");
   }
 
@@ -101,7 +101,7 @@ async function telegram(req, env) {
 
   const ticket = crypto.randomUUID();
   await env.KV.put("link:" + ticket, link, { expirationTtl: 86400 });   // the link never goes to GitHub, only this ticket
-  const inputs = { ticket, chat, also: chat === owner ? "" : owner };
+  const inputs = { ticket, chat, also: "" };
   if (name) inputs.name = name;
   const r = await fetch(`https://api.github.com/repos/${env.REPO}/actions/workflows/${env.WORKFLOW || "record.yml"}/dispatches`, {
     method: "POST",
@@ -128,14 +128,22 @@ async function giveLink(req, env, u) {
 
 async function giveCmds(req, env, u) {
   if (!keyOk(req, env)) return json({}, 403);
+  const run = u.searchParams.get("run") || "";
+  const me = u.searchParams.get("me") || "";
   const out = [];
   for (const c of (u.searchParams.get("chats") || "").split(",").map((s) => s.trim()).filter(Boolean)) {
     const k = "cmd:" + c;
     const v = await env.KV.get(k);
-    if (v) {
-      await env.KV.delete(k);
-      for (const x of JSON.parse(v)) if (!out.includes(x)) out.push(x);
+    if (!v) continue;
+    const keep = [];
+    for (const x of JSON.parse(v)) {
+      const at = x.indexOf("@");
+      // a button carries its run id: only that run takes it. A typed command goes only to the run that chat started.
+      const mine = at >= 0 ? x.slice(at + 1) === run : c === me;
+      if (mine) { if (!out.includes(x.split("@")[0])) out.push(x.split("@")[0]); } else keep.push(x);
     }
+    if (keep.length) await env.KV.put(k, JSON.stringify(keep), { expirationTtl: 600 });
+    else await env.KV.delete(k);
   }
   return json({ cmds: out });
 }

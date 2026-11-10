@@ -65,6 +65,16 @@ async function telegram(req, env) {
       await tgApi(env, "answerCallbackQuery", { callback_query_id: cq.id, text: "Not allowed" });
       return new Response("ok");
     }
+    const act = String(cq.data).split("@")[0];
+    const first = String((cq.message && cq.message.text) || "").split("\n")[0];
+    if (act === "status" && cq.message && /LIVE RECORDING|DOWNLOADING/.test(first)) {
+      // the live panel is edited every 5 seconds, so copy it right now: instant status, no waiting for the recording
+      const r = await (await tgApi(env, "copyMessage", { chat_id: chat, from_chat_id: chat, message_id: cq.message.message_id, reply_markup: cq.message.reply_markup })).json().catch(() => ({}));
+      if (r && r.ok) {
+        await tgApi(env, "answerCallbackQuery", { callback_query_id: cq.id, text: "Status" });
+        return new Response("ok");
+      }
+    }
     await pushCmd(env, chat, cq.data);
     await tgApi(env, "answerCallbackQuery", { callback_query_id: cq.id, text: String(cq.data).startsWith("stop") ? "Stopping... (few seconds)" : "Sent (few seconds)" });
     return new Response("ok");

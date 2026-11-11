@@ -86,7 +86,7 @@ jobs:
       OUT_DIR: /mnt/rec
       MP4_DIR: rec_mp4
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       - name: Install ffmpeg
         timeout-minutes: 10
         run: |

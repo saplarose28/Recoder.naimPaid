@@ -233,6 +233,30 @@ def same_sig(a, b):
     return b is not None and n >= 8 and a[:n] == b[:n]
 
 
+def nal_key(pk, vtype):
+    """Many servers do not set the random-access flag. Then look into the first packet of the picture for a keyframe
+    marker: H.264 SPS/IDR, HEVC VPS/SPS/IRAP, MPEG-2 sequence header / I picture."""
+    p = 4
+    if (pk[3] >> 4) & 2:
+        p += 1 + pk[4]
+    if p + 10 >= 188 or pk[p] != 0 or pk[p + 1] != 0 or pk[p + 2] != 1:
+        return False
+    d = pk[p + 9 + pk[p + 8]:]
+    i = 0
+    while True:
+        j = d.find(b"\x00\x00\x01", i)
+        if j < 0 or j + 4 >= len(d):
+            return False
+        b = d[j + 3]
+        if vtype == 0x1b and (b & 0x1f) in (5, 7):
+            return True
+        if vtype == 0x24 and ((b >> 1) & 0x3f) in (16, 17, 18, 19, 20, 21, 32, 33):
+            return True
+        if vtype in (0x02, 0x10) and (b == 0xB3 or (b == 0x00 and ((d[j + 5] >> 3) & 7) == 1)):
+            return True
+        i = j + 3
+
+
 class Splitter:
     def __init__(self, on_done):
         self.on_done = on_done
@@ -248,6 +272,7 @@ class Splitter:
         self.gap_total = 0.0
         self.skip = None; self.dropping = set(); self.drop_bytes = 0; self.deduped = 0; self.last_write = time.time(); self.last_es = time.time()
         self.need_key = False; self.need_key_until = 0
+        self.vtype = None; self.nokey_pes = 0; self.nokey_warned = False
         self.first_pts = None
         self.recent = {}; self.verify = False                # dts -> fingerprint of recently saved pictures
 
@@ -338,7 +363,7 @@ class Splitter:
         q, end = p + 12 + info, min(p + 3 + sec - 4, 188)
         while q + 5 <= end:
             if pk[q] in (0x1b, 0x24, 0x02, 0x10) and self.vid is None:
-                self.vid = ((pk[q + 1] & 31) << 8) | pk[q + 2]
+                self.vid = ((pk[q + 1] & 31) << 8) | pk[q + 2]; self.vtype = pk[q]
             elif pk[q] in (0x0f, 0x11, 0x03, 0x04, 0x81, 0x87):
                 self.aud.add(((pk[q + 1] & 31) << 8) | pk[q + 2])
             q += 5 + (((pk[q + 3] & 15) << 8) | pk[q + 4])
@@ -403,7 +428,7 @@ class Splitter:
                         self.skip = None; self.dropping = set()
                     continue
             if self.need_key and is_es:
-                if pid == self.vid and pusi and (pk[3] >> 4) & 2 and pk[4] > 0 and (pk[5] & 0x40):
+                if pid == self.vid and pusi and (((pk[3] >> 4) & 2 and pk[4] > 0 and (pk[5] & 0x40)) or nal_key(pk, self.vtype)):
                     self.need_key = False
                 elif time.time() > self.need_key_until:
                     self.need_key = False
@@ -441,6 +466,17 @@ class Splitter:
                         del self.recent[next(iter(self.recent))]
                 if (pk[3] >> 4) & 2 and pk[4] > 0 and (pk[5] & 0x40):
                     key = True                            # random access indicator = keyframe starts here
+                elif nal_key(pk, self.vtype):
+                    key = True                            # the server sets no flag: the picture data itself shows a keyframe
+                elif self.f is None and self.pat and self.pmt:
+                    self.nokey_pes += 1                   # no marker at all for a long time: start at an ordinary picture, never lose the whole recording
+                    if self.nokey_pes > 400:
+                        key = True
+                        if not self.nokey_warned:
+                            self.nokey_warned = True
+                            print("No keyframe marker found in the stream: the file starts at an ordinary picture", flush=True)
+                elif self.f is not None and self.cur_bytes >= PART_MAX + 64_000_000:
+                    key = True                            # never a keyframe marker and the file is too big: cut here
             elif pid in self.aud and pusi and dts is not None:
                 self.last_wr[pid] = dts
             if self.f is None:
@@ -1391,6 +1427,10 @@ def dl_hls_once(rq, first):
 def archive_report():
     """After an archive download: does the file have everything the playlist promised?"""
     try:
+        if SP and SP.part_no == 0 and SP.total > 1_000_000:
+            print("Archive report: data was read (%d MB) but no file was started" % (SP.total // 1_000_000), flush=True)
+            say("⚠️ <b>The download ran but nothing could be saved.</b> The video data was not recognised. Tell the owner, with this run's log.")
+            return
         got = D["secs"] if KIND != "ts" else (SP.media_total() if SP else 0)
         jumps = SP.rebased if SP else 0
         gap = SP.gap_total if SP else 0.0

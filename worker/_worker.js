@@ -107,12 +107,16 @@ async function telegram(req, env) {
     return new Response("ok");
   }
   const link = found[0].replace(/[)>,]+$/, "");
-  const name = text.replace(found[0], "").replace(/[^\w\- ]+/g, "").trim().replace(/\s+/g, "_").slice(0, 40);
+  const rest = text.replace(found[0], "");
+  // a word after the link decides what to do: "archive" / "download" = download the finished file, "live" / "rec" = record a running stream
+  const mode = /\b(archive|download|dl)\b/i.test(rest) ? "archive" : (/\b(live|rec|record)\b/i.test(rest) ? "live" : "");
+  const name = rest.replace(/\b(archive|download|dl|live|rec|record)\b/gi, "").replace(/[^\w\- ]+/g, "").trim().replace(/\s+/g, "_").slice(0, 40);
 
   const ticket = crypto.randomUUID();
   await env.KV.put("link:" + ticket, link, { expirationTtl: 86400 });   // the link never goes to GitHub, only this ticket
   const inputs = { ticket, chat, also: "" };
   if (name) inputs.name = name;
+  if (mode) inputs.mode = mode;
   const r = await fetch(`https://api.github.com/repos/${env.REPO}/actions/workflows/${env.WORKFLOW || "record.yml"}/dispatches`, {
     method: "POST",
     headers: {
@@ -122,7 +126,7 @@ async function telegram(req, env) {
     body: JSON.stringify({ ref: env.BRANCH || "main", inputs }),
   });
   if (r.status === 204) {
-    await send(env, chat, "✅ Got the link. Recording is starting on GitHub. You will get a message here in about a minute.");
+    await send(env, chat, mode === "archive" ? "✅ Got the link. Downloading the archive: it is starting on GitHub. You will get a message here in about a minute." : (mode === "live" ? "✅ Got the link. Recording a live stream: it is starting on GitHub. You will get a message here in about a minute." : "✅ Got the link. It is starting on GitHub (a live stream is recorded, a finished archive is downloaded; the bot finds out itself). You will get a message here in about a minute. To force it, send the link with the word archive or live after it."));
   } else {
     const t = (await r.text()).slice(0, 200);
     await send(env, chat, `❌ Could not start the recording (GitHub said ${r.status}).\n<code>${esc(t)}</code>\nTell the owner.`);

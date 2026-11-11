@@ -1164,9 +1164,11 @@ def chain(rem_minutes):
     say("⏳ The 6 hour job limit is near. Starting the next run to continue...")
     if ASKED and not TICKET:
         say("🔁 A new run starts now. <b>Send the stream link again</b> when it asks, so the link is never shown on GitHub.")
-    cmd = ["gh", "workflow", "run", "record.yml", "--repo", REPO, "-f", "url=" + ("ask" if ASKED else URL), "-f", "minutes=%d" % rem_minutes,
-           "-f", "ticket=" + TICKET, "-f", "chat=" + (CHAT or ""), "-f", "also=" + ",".join(ALSO),
+    wf = E("WORKFLOW_FILE") or "record.yml"                  # the personal workflow starts itself again, not the shared one
+    cmd = ["gh", "workflow", "run", wf, "--repo", REPO, "-f", "url=" + ("ask" if ASKED else URL), "-f", "minutes=%d" % rem_minutes,
            "-f", "name=" + NAME, "-f", "part_min=%s" % PART_MIN, "-f", "part_mb=%d" % (PART_MAX / 1e6)]
+    if wf == "record.yml":
+        cmd += ["-f", "ticket=" + TICKET, "-f", "chat=" + (CHAT or ""), "-f", "also=" + ",".join(ALSO)]
     if REFERER:
         cmd += ["-f", "referer=" + REFERER]
     subprocess.run(cmd)
@@ -1231,22 +1233,73 @@ def ts_pull(rq):
         except Exception: pass
 
 
+ARCH_WHY = [""]
+
+
+def hls_is_archive():
+    """(True/False, reason) for an .m3u8: a finished file or a running stream?"""
+    import urllib.parse as up
+    def get(x):
+        return http_get(x, None, 25)[2].decode("utf-8", "ignore")
+    u = URL
+    text = get(u)
+    for _ in range(2):                                         # a master playlist: look at the real stream inside it
+        if "#EXT-X-STREAM-INF" not in text:
+            break
+        lines, best = text.splitlines(), None
+        for k, l in enumerate(lines):
+            if l.startswith("#EXT-X-STREAM-INF"):
+                m = re.search(r"BANDWIDTH=(\d+)", l)
+                bw = int(m.group(1)) if m else 0
+                for l2 in lines[k + 1:]:
+                    if l2.strip() and not l2.startswith("#"):
+                        if best is None or bw > best[0]:
+                            best = (bw, up.urljoin(u, l2.strip()))
+                        break
+        if not best:
+            break
+        u = best[1]; text = get(u)
+    if "#EXT-X-ENDLIST" in text:
+        return True, "the playlist has an end tag"
+    if re.search(r"#EXT-X-PLAYLIST-TYPE:\s*VOD", text):
+        return True, "the playlist says it is a VOD"
+    def sig(t):
+        return [l.strip() for l in t.splitlines() if l.strip() and not l.startswith("#")]
+    m = re.search(r"#EXT-X-TARGETDURATION:(\d+)", text)
+    wait = min(15.0, max(6.0, 1.6 * float(m.group(1)))) if m else 8.0
+    time.sleep(wait)                                           # a running stream adds new parts meanwhile, a finished file does not
+    text2 = get(u)
+    if "#EXT-X-ENDLIST" in text2:
+        return True, "the playlist has an end tag"
+    if sig(text) == sig(text2):
+        return True, "the playlist did not change for %d seconds, so it is a finished file" % wait
+    return False, "the playlist keeps getting new parts"
+
+
 def detect_archive():
     """True if the link is a finished file (timeshift / catch-up), False if it is a live stream."""
     if MODE == "live":
-        return False
+        ARCH_WHY[0] = "you chose live"; return False
     if MODE == "archive":
-        return True
+        ARCH_WHY[0] = "you chose archive"; return True
     try:
+        if KIND != "ts":
+            ok, why = hls_is_archive()
+            ARCH_WHY[0] = why
+            return ok
         r = stream_opener().open(urllib.request.Request(URL, headers=hdr_dict()), timeout=20)
         try:
-            if KIND == "ts":
-                cl = r.headers.get("Content-Length")           # a live stream has no length, a file has
-                return bool(cl and cl.isdigit() and int(cl) > 500_000)
-            return "#EXT-X-ENDLIST" in r.read(400000).decode("utf-8", "ignore")   # a finished playlist ends with this tag
+            cl = r.headers.get("Content-Length")               # a live stream has no length, a file has
+            if cl and cl.isdigit() and int(cl) > 500_000:
+                ARCH_WHY[0] = "the server gives a file size (%s)" % human(int(cl)); return True
         finally:
             r.close()
-    except Exception:
+        if re.search(r"timeshift|catch-?up|/archive/|/vod/", URL, re.I):
+            ARCH_WHY[0] = "the link looks like a timeshift / archive link"; return True
+        ARCH_WHY[0] = "the server gives no file size"
+        return False
+    except Exception as e:
+        ARCH_WHY[0] = "could not check (%s)" % mask(repr(e))[:80]
         return False
 
 
@@ -1309,7 +1362,7 @@ def dl_hls_once(rq, first):
     before = D["secs"]
     ss = ["-ss", "%.1f" % (D["secs"] - 30)] if D["secs"] > 35 else []        # restart 30 s earlier, the repeated part is dropped
     cmd = ["ffmpeg", "-hide_banner", "-loglevel", "warning", "-y", "-fflags", "+discardcorrupt+genpts", "-rw_timeout", "60000000",
-           "-reconnect", "1", "-reconnect_streamed", "1", "-reconnect_delay_max", "15", "-seg_max_retry", "15", "-http_persistent", "0"] + ss + HDR + [
+           "-reconnect", "1", "-reconnect_streamed", "1", "-reconnect_delay_max", "15", "-seg_max_retry", "15", "-live_start_index", "0", "-max_reload", "3", "-m3u8_hold_counters", "3", "-http_persistent", "0"] + ss + HDR + [
            "-i", URL, "-map", "0:v?", "-map", "0:a?", "-c", "copy", "-copyts", "-muxdelay", "0", "-muxpreload", "0",
            "-f", "mpegts", "-mpegts_flags", "+resend_headers", "pipe:1"]
     if not first:
@@ -1818,16 +1871,17 @@ def record():
         say("❌ <b>The link could not be opened from GitHub's server</b>\n<b>Reason:</b> %s\n\n<code>%s</code>" % (esc(why), esc(err[-300:])))
         sys.exit(1)
     ARCHIVE = detect_archive()
-    print("Link type: %s" % ("finished file (archive): it is downloaded completely" if ARCHIVE else "live stream"), flush=True)
+    print("Link type: %s (%s)" % ("finished file (archive): it is downloaded completely" if ARCHIVE else "live stream", ARCH_WHY[0]), flush=True)
     plan = ("stops after %d min" % MINUTES) if MINUTES else "runs until you press Stop"
     kind_txt = "📡 <b>MPEG-TS live stream</b> (starts now, no rewind)" if KIND == "ts" else "📡 HLS stream"
     every = "every %s%s" % (human(PART_MAX), (" or %g min" % PART_MIN) if PART_MIN > 0 else "")
     if ARCHIVE:
-        say("⬇️ <b>Archive download started</b>\n🎬 %s\n📡 %s\n✂️ New file every %s\n📍 Stream server sees an IP in: %s\nEach file is uploaded when it is full. Use Status to see the progress." %
-            (esc(NAME), "finished .ts file" if KIND == "ts" else "finished .m3u8 playlist", human(PART_MAX), esc(where())), buttons=True)
+        say("⬇️ <b>Archive download started</b>\n🎬 %s\n📡 %s\n✂️ New file every %s\n📍 Stream server sees an IP in: %s\nEach file is uploaded when it is full. Use Status to see the progress.\n🔎 Detected as an archive: %s." %
+            (esc(NAME), "finished .ts file" if KIND == "ts" else "finished .m3u8 playlist", human(PART_MAX), esc(where()), esc(ARCH_WHY[0])), buttons=True)
     else:
-        say("🔴 <b>Recording started</b>\n🎬 %s\n%s\n⏱ %s\n✂️ New file %s (whichever comes first)\n📍 Stream server sees an IP in: %s\nThe first download link comes after the first file is full." %
-            (esc(NAME), kind_txt, plan, every, esc(where())), buttons=True)
+        say("🔴 <b>Recording started</b>\n🎬 %s\n%s\n⏱ %s\n✂️ New file %s (whichever comes first)\n📍 Stream server sees an IP in: %s\nThe first download link comes after the first file is full.\n🔎 Detected as a live stream: %s.%s" %
+            (esc(NAME), kind_txt, plan, every, esc(where()), esc(ARCH_WHY[0]),
+             "" if MODE != "auto" else "\nIf this is a finished archive, send the link again with the word <b>archive</b> after it."), buttons=True)
     signal.signal(signal.SIGINT, lambda *a: halt())
     signal.signal(signal.SIGTERM, lambda *a: halt())
     total = MINUTES * 60

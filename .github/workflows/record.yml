@@ -64,6 +64,11 @@ jobs:
     timeout-minutes: 355
     env:
       PYTHONUNBUFFERED: "1"
+      PARALLEL: "32"            # connections for big archive downloads (lower it if the provider blocks you)
+      PAR_CHUNK_MB: "16"        # size of each downloaded piece
+      TS_PAR: "8"               # connections for timeshift links without file size
+      MIN_FREE_GB: "12"         # the download waits for uploads when the disk has less free space
+      LIVE_CARD: "0"            # "1" = picture dashboard, "0" = text panel
       TG_TOKEN: ${{ secrets.TG_TOKEN }}
       TG_CHAT: ${{ inputs.chat || secrets.TG_CHAT }}
       TG_ALSO: ${{ inputs.also }}
@@ -118,6 +123,12 @@ jobs:
             cd - >/dev/null
           fi
           if have; then ffmpeg -version | head -1; else echo "::error title=ffmpeg could not be installed::All 3 ways failed. Press Re-run jobs once more."; exit 1; fi
+      - name: Picture dashboard tools
+        continue-on-error: true
+        timeout-minutes: 5
+        run: |
+          python3 -c "import PIL" 2>/dev/null || pip install -q --break-system-packages --upgrade pillow
+          python3 -c "import PIL; print('Pillow', PIL.__version__)"
       - name: Use the second disk for recording
         run: sudo mkdir -p /mnt/rec && sudo chown "$USER" /mnt/rec
       - name: Record

@@ -10,7 +10,8 @@
 //   ALLOWED         chat ids that may use the bot, comma separated. The FIRST one is the owner.
 //   BRANCH          (optional) default "main"
 //   WORKFLOW        (optional) default "record.yml"
-// KV namespace binding named: KV
+// D1 database binding named: DB   (the tables are created by the worker itself the first time it runs)
+// D1 free plan: 5 million rows read and 100,000 rows written a day (KV had only 100,000 reads and 1,000 writes).
 
 const URL_RE = /https?:\/\/[^\s<>"']+/i;
 const json = (o, status = 200) => new Response(JSON.stringify(o), { status, headers: { "content-type": "application/json" } });
@@ -20,6 +21,8 @@ export default {
   async fetch(req, env) {
     const u = new URL(req.url);
     try {
+      if (!env.DB) { console.log("D1 binding DB is missing"); return new Response("no database", { status: 500 }); }
+      await init(env);
       if (u.pathname === "/tg" && req.method === "POST") return await telegram(req, env);
       if (u.pathname === "/link") return await giveLink(req, env, u);
       if (u.pathname === "/cmd") return await giveCmds(req, env, u);
@@ -36,14 +39,31 @@ async function tgApi(env, method, body) {
     method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(body),
   });
 }
+const now = () => Math.floor(Date.now() / 1000);
+let ready = false;
+async function init(env) {                                     // creates the tables once (does nothing if they exist)
+  if (ready) return;
+  await env.DB.batch([
+    env.DB.prepare("CREATE TABLE IF NOT EXISTS links (ticket TEXT PRIMARY KEY, url TEXT NOT NULL, exp INTEGER NOT NULL)"),
+    env.DB.prepare("CREATE TABLE IF NOT EXISTS cmds (id INTEGER PRIMARY KEY AUTOINCREMENT, chat TEXT NOT NULL, cmd TEXT NOT NULL, exp INTEGER NOT NULL)"),
+    env.DB.prepare("CREATE INDEX IF NOT EXISTS cmds_chat ON cmds (chat)"),
+    env.DB.prepare("CREATE TABLE IF NOT EXISTS seen (upd INTEGER PRIMARY KEY, exp INTEGER NOT NULL)"),
+  ]);
+  ready = true;
+}
+async function cleanup(env) {                                  // old rows go away (runs only when somebody sends a message, not on every poll)
+  const t = now();
+  await env.DB.batch([
+    env.DB.prepare("DELETE FROM links WHERE exp < ?").bind(t),
+    env.DB.prepare("DELETE FROM cmds WHERE exp < ?").bind(t),
+    env.DB.prepare("DELETE FROM seen WHERE exp < ?").bind(t),
+  ]);
+}
 const send = (env, chat, text) => tgApi(env, "sendMessage", { chat_id: chat, text, parse_mode: "HTML", disable_web_page_preview: true });
 const keyOk = (req, env) => !!env.WORKER_KEY && req.headers.get("X-Key") === env.WORKER_KEY;
 
 async function pushCmd(env, chat, cmd) {
-  const k = "cmd:" + chat;
-  const cur = JSON.parse((await env.KV.get(k)) || "[]");
-  cur.push(cmd);
-  await env.KV.put(k, JSON.stringify(cur), { expirationTtl: 600 });
+  await env.DB.prepare("INSERT INTO cmds (chat, cmd, exp) VALUES (?, ?, ?)").bind(chat, cmd, now() + 600).run();
 }
 
 async function telegram(req, env) {
@@ -52,8 +72,9 @@ async function telegram(req, env) {
   }
   const up = await req.json();
   if (up.update_id != null) {                                  // Telegram may send the same update twice: never start two runs
-    if (await env.KV.get("upd:" + up.update_id)) return new Response("ok");
-    await env.KV.put("upd:" + up.update_id, "1", { expirationTtl: 3600 });
+    const r = await env.DB.prepare("INSERT OR IGNORE INTO seen (upd, exp) VALUES (?, ?)").bind(up.update_id, now() + 3600).run();
+    if (r.meta && r.meta.changes === 0) return new Response("ok");
+    await cleanup(env);
   }
   const allowed = (env.ALLOWED || "").split(",").map((s) => s.trim()).filter(Boolean);
   const owner = allowed[0];
@@ -66,8 +87,8 @@ async function telegram(req, env) {
       return new Response("ok");
     }
     const act = String(cq.data).split("@")[0];
-    const first = String((cq.message && cq.message.text) || "").split("\n")[0];
-    if (act === "status" && cq.message && /LIVE RECORDING|DOWNLOADING/.test(first)) {
+    const first = String((cq.message && cq.message.text) || "").split("\n").slice(0, 3).join(" ");
+    if (act === "status" && cq.message && /LIVE RECORDING|DOWNLOADING|𝗟𝗜𝗩𝗘 𝗥𝗘𝗖|𝗗𝗢𝗪𝗡𝗟𝗢𝗔𝗗/.test(first)) {
       // the live panel is edited every 5 seconds, so copy it right now: instant status, no waiting for the recording
       const r = await (await tgApi(env, "copyMessage", { chat_id: chat, from_chat_id: chat, message_id: cq.message.message_id, reply_markup: cq.message.reply_markup })).json().catch(() => ({}));
       if (r && r.ok) {
@@ -113,7 +134,7 @@ async function telegram(req, env) {
   const name = rest.replace(/\b(archive|download|dl|live|rec|record)\b/gi, "").replace(/[^\w\- ]+/g, "").trim().replace(/\s+/g, "_").slice(0, 40);
 
   const ticket = crypto.randomUUID();
-  await env.KV.put("link:" + ticket, link, { expirationTtl: 86400 });   // the link never goes to GitHub, only this ticket
+  await env.DB.prepare("INSERT INTO links (ticket, url, exp) VALUES (?, ?, ?)").bind(ticket, link, now() + 86400).run();   // the link never goes to GitHub, only this ticket
   const inputs = { ticket, chat, also: "" };
   if (name) inputs.name = name;
   if (mode) inputs.mode = mode;
@@ -136,28 +157,26 @@ async function telegram(req, env) {
 
 async function giveLink(req, env, u) {
   if (!keyOk(req, env)) return json({}, 403);
-  const v = await env.KV.get("link:" + (u.searchParams.get("ticket") || ""));
-  return v ? json({ url: v }) : json({}, 404);
+  const row = await env.DB.prepare("SELECT url FROM links WHERE ticket = ? AND exp > ?").bind(u.searchParams.get("ticket") || "", now()).first();
+  return row ? json({ url: row.url }) : json({}, 404);
 }
 
 async function giveCmds(req, env, u) {
   if (!keyOk(req, env)) return json({}, 403);
   const run = u.searchParams.get("run") || "";
   const meRaw = u.searchParams.get("me");                       // an older gh_record.py sends no "me": then typed commands go to every run of that chat
-  const out = [];
-  for (const c of (u.searchParams.get("chats") || "").split(",").map((s) => s.trim()).filter(Boolean)) {
-    const k = "cmd:" + c;
-    const v = await env.KV.get(k);
-    if (!v) continue;
-    const keep = [];
-    for (const x of JSON.parse(v)) {
-      const at = x.indexOf("@");
-      // a button carries its run id: only that run takes it. A typed command goes only to the run that chat started.
-      const mine = at >= 0 ? x.slice(at + 1) === run : (meRaw === null || c === meRaw);
-      if (mine) { if (!out.includes(x.split("@")[0])) out.push(x.split("@")[0]); } else keep.push(x);
-    }
-    if (keep.length) await env.KV.put(k, JSON.stringify(keep), { expirationTtl: 600 });
-    else await env.KV.delete(k);
+  const chats = (u.searchParams.get("chats") || "").split(",").map((s) => s.trim()).filter(Boolean);
+  if (!chats.length) return json({ cmds: [] });
+  // one query, answered from the index: when nothing is waiting, it reads no rows at all
+  const rows = (await env.DB.prepare("SELECT id, chat, cmd FROM cmds WHERE chat IN (" + chats.map(() => "?").join(",") + ") AND exp > ? ORDER BY id")
+    .bind(...chats, now()).all()).results || [];
+  const out = [], take = [];
+  for (const r of rows) {
+    const x = r.cmd, at = x.indexOf("@");
+    // a button carries its run id: only that run takes it. A typed command goes only to the run that chat started.
+    const mine = at >= 0 ? x.slice(at + 1) === run : (meRaw === null || r.chat === meRaw);
+    if (mine) { take.push(r.id); if (!out.includes(x.split("@")[0])) out.push(x.split("@")[0]); }
   }
+  if (take.length) await env.DB.prepare("DELETE FROM cmds WHERE id IN (" + take.map(() => "?").join(",") + ")").bind(...take).run();
   return json({ cmds: out });
 }

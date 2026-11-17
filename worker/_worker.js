@@ -21,6 +21,13 @@ export default {
   async fetch(req, env) {
     const u = new URL(req.url);
     try {
+      if (u.pathname === "/health") {                          // open  https://your-domain/health  in the browser to see what is wrong
+        if (!env.DB) return new Response("PROBLEM: the D1 binding named DB is missing. Add it (Variable name DB, database recdb), then deploy again.", { status: 500 });
+        try { await init(env); await env.DB.prepare("SELECT 1").first(); } catch (e) { return new Response("PROBLEM: the database answered with an error: " + (e && e.message), { status: 500 }); }
+        const miss = ["TG_TOKEN", "WEBHOOK_SECRET", "GH_PAT", "WORKER_KEY", "REPO", "ALLOWED"].filter((k) => !env[k]);
+        return new Response(miss.length ? "Database OK. But these variables are missing: " + miss.join(", ") : "All OK: database connected, all variables set.");
+      }
+      if (u.pathname !== "/tg" && u.pathname !== "/link" && u.pathname !== "/cmd") return new Response("ok");
       if (!env.DB) { console.log("D1 binding DB is missing"); return new Response("no database", { status: 500 }); }
       await init(env);
       if (u.pathname === "/tg" && req.method === "POST") return await telegram(req, env);
